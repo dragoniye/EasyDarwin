@@ -104,6 +104,7 @@ type Session struct {
 
 	authorizationEnable bool
 	nonce               string
+	closeOld            bool
 
 	AControl string
 	VControl string
@@ -140,6 +141,7 @@ func NewSession(server *Server, conn net.Conn) *Session {
 	timeoutMillis := utils.Conf().Section("rtsp").Key("timeout").MustInt(0)
 	timeoutTCPConn := &RichConn{conn, time.Duration(timeoutMillis) * time.Millisecond}
 	authorizationEnable := utils.Conf().Section("rtsp").Key("authorization_enable").MustInt(0)
+	close_old := utils.Conf().Section("rtsp").Key("close_old").MustInt(0)
 	session := &Session{
 		ID:                  shortid.MustGenerate(),
 		Server:              server,
@@ -154,6 +156,7 @@ func NewSession(server *Server, conn net.Conn) *Session {
 		vRTPControlChannel:  -1,
 		aRTPChannel:         -1,
 		aRTPControlChannel:  -1,
+		closeOld:            close_old != 0,
 	}
 
 	session.logger = log.New(os.Stdout, fmt.Sprintf("[%s]", session.ID), log.LstdFlags|log.Lshortfile)
@@ -187,6 +190,7 @@ func (session *Session) Start() {
 	buf1 := make([]byte, 1)
 	buf2 := make([]byte, 2)
 	logger := session.logger
+	timer := time.Unix(0, 0)
 	for !session.Stoped {
 		if _, err := io.ReadFull(session.connRW, buf1); err != nil {
 			logger.Println(session, err)
@@ -216,6 +220,11 @@ func (session *Session) Start() {
 					Type:   RTP_TYPE_AUDIO,
 					Buffer: rtpBuf,
 				}
+				elapsed := time.Now().Sub(timer)
+				if elapsed >= 30*time.Second {
+					logger.Println("Recv an audio RTP package")
+					timer = time.Now()
+				}
 			case session.aRTPControlChannel:
 				pack = &RTPPack{
 					Type:   RTP_TYPE_AUDIOCONTROL,
@@ -225,6 +234,11 @@ func (session *Session) Start() {
 				pack = &RTPPack{
 					Type:   RTP_TYPE_VIDEO,
 					Buffer: rtpBuf,
+				}
+				elapsed := time.Now().Sub(timer)
+				if elapsed >= 30*time.Second {
+					logger.Println("Recv an video RTP package")
+					timer = time.Now()
 				}
 			case session.vRTPControlChannel:
 				pack = &RTPPack{
@@ -354,6 +368,7 @@ func (session *Session) handleRequest(req *Request) {
 	res := NewResponse(200, "OK", req.Header["CSeq"], session.ID, "")
 	defer func() {
 		if p := recover(); p != nil {
+			logger.Printf("handleRequest err ocurs:%v",p)
 			res.StatusCode = 500
 			res.Status = fmt.Sprintf("Inner Server Error, %v", p)
 		}
@@ -369,8 +384,8 @@ func (session *Session) handleRequest(req *Request) {
 			switch session.Type {
 			case SESSEION_TYPE_PLAYER:
 				session.Pusher.AddPlayer(session.Player)
-			case SESSION_TYPE_PUSHER:
-				session.Server.AddPusher(session.Pusher)
+				// case SESSION_TYPE_PUSHER:
+				// 	session.Server.AddPusher(session.Pusher)
 			}
 		case "TEARDOWN":
 			{
@@ -435,12 +450,12 @@ func (session *Session) handleRequest(req *Request) {
 			logger.Printf("video codec[%s]\n", session.VCodec)
 		}
 		session.Pusher = NewPusher(session)
-		if session.Server.GetPusher(session.Path) == nil {
-			session.Server.AddPusher(session.Pusher)
-		} else {
+
+		addedToServer := session.Server.AddPusher(session.Pusher, session.closeOld)
+		if !addedToServer {
+			logger.Printf("reject pusher.")
 			res.StatusCode = 406
 			res.Status = "Not Acceptable"
-			return
 		}
 	case "DESCRIBE":
 		session.Type = SESSEION_TYPE_PLAYER
